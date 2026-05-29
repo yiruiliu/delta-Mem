@@ -1725,6 +1725,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--online-gain", type=float, default=0.05)
     parser.add_argument(
+        "--init-adapter-dir",
+        default=None,
+        type=str,
+        help=(
+            "Optional: path to a data-aware initialized adapter directory produced by "
+            "scripts/run_data_aware_init.py.  When set, the adapter weights are loaded "
+            "AFTER attach_delta_mem() so SFT starts from the data-aware subspace rather "
+            "than random initialization.  The delta-Mem config embedded in the adapter "
+            "directory must match the --rank / --delta-heads / etc. arguments passed here."
+        ),
+    )
+    parser.add_argument(
         "--target-layers",
         default="off",
         help="Comma-separated attention layer indices to wrap with Delta-Mem. 'off' means all layers.",
@@ -2758,6 +2770,16 @@ def main() -> None:
         memory_write_proposals_per_message=args.memory_write_proposals_per_message,
     )
     replaced = attach_delta_mem(model, delta_config)
+
+    # Data-aware initialization: load pre-computed subspace-aligned adapter weights
+    # produced by scripts/run_data_aware_init.py BEFORE freezing the backbone so
+    # that the optimizer sees the correct starting point.
+    if getattr(args, "init_adapter_dir", None):
+        from deltamem.core.delta_impl import load_delta_mem_adapter as _load_adapter
+        print(f"[data-aware init] Loading adapter from: {args.init_adapter_dir}", flush=True)
+        _load_adapter(model, args.init_adapter_dir)
+        print("[data-aware init] Adapter loaded successfully.", flush=True)
+
     trainable_names = freeze_non_delta_mem_params(model)
 
     warmup_steps = compute_warmup_steps(

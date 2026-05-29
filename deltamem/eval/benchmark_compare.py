@@ -268,6 +268,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument(
+        "--hotpotqa-local-path",
+        type=Path,
+        default=None,
+        help="Path to a local HotpotQA JSONL file (bypass HuggingFace download).",
+    )
+    parser.add_argument(
         "--eval-batch-size",
         type=int,
         default=32,
@@ -612,7 +618,18 @@ def load_hotpotqa(
     max_samples: int | None,
     seed: int,
     local_files_only: bool,
+    local_path: "Path | None" = None,
 ) -> list[dict]:
+    if local_path is not None:
+        import json as _json
+        with open(local_path, encoding="utf-8") as _f:
+            rows = [_json.loads(line) for line in _f if line.strip()]
+        if max_samples is not None:
+            import random as _random
+            _rng = _random.Random(seed)
+            _random.shuffle(rows)
+            rows = rows[:max_samples]
+        return rows
     dataset = load_dataset_cached(
         "hotpotqa/hotpot_qa",
         name="distractor",
@@ -2700,6 +2717,7 @@ def load_task_items(task_name: str, args: argparse.Namespace) -> list[dict]:
             max_samples=args.max_samples,
             seed=args.seed,
             local_files_only=args.local_files_only,
+            local_path=getattr(args, "hotpotqa_local_path", None),
         )
     if task_name == "memory_agent_bench":
         return load_memory_agent_bench(

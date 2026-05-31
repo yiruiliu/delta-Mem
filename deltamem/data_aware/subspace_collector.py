@@ -37,15 +37,22 @@ class LayerSubspaces:
     S_h:  [hidden_size]               — corresponding singular values (sqrt eigenvalues)
     V_q:  [q_out, q_out]              — principal directions of Q-projection output
     S_q:  [q_out]
+    V_k:  [k_out, k_out]              — principal directions of K-projection output
+    S_k:  [k_out]
+    V_v:  [v_out, v_out]              — principal directions of V-projection output
+    S_v:  [v_out]
     ner_h: normalized effective rank of hidden states
     ner_q: normalized effective rank of Q outputs
-    energy_h: fraction of hidden-state variance in top-rank directions
     """
     layer_idx: int
     V_h: torch.Tensor
     S_h: torch.Tensor
     V_q: torch.Tensor
     S_q: torch.Tensor
+    V_k: Optional[torch.Tensor] = None
+    S_k: Optional[torch.Tensor] = None
+    V_v: Optional[torch.Tensor] = None
+    S_v: Optional[torch.Tensor] = None
     ner_h: float = 0.0
     ner_q: float = 0.0
 
@@ -90,6 +97,7 @@ def collect_layer_subspaces(
     calib_inputs: List[Dict[str, torch.Tensor]],
     *,
     target_layer_indices: Optional[List[int]] = None,
+    collect_kv: bool = False,
     device: str | torch.device = "cuda",
     show_progress: bool = True,
     log_stats: bool = True,
@@ -125,6 +133,9 @@ def collect_layer_subspaces(
     svd_q: Dict[int, IncrementalSVD] = {}   # q-proj-output SVDs
     hooks = []
 
+    svd_k: Dict[int, IncrementalSVD] = {}
+    svd_v: Dict[int, IncrementalSVD] = {}
+
     for idx in target_layer_indices:
         layer = layers[idx]
         attn = _get_attn_module(layer)
@@ -134,11 +145,17 @@ def collect_layer_subspaces(
         svd_h[idx] = IncrementalSVD(dim=hidden_size, device=device, name=f"hidden_L{idx}")
         svd_q[idx] = IncrementalSVD(dim=q_out, device=device, name=f"q_out_L{idx}")
 
-        # Hook hidden states: capture INPUT to the attention sub-module
-        # with_kwargs=True: newer transformers passes inputs as kwargs
         hooks.append(attn.register_forward_pre_hook(_make_input_hook(svd_h[idx]), with_kwargs=True))
-        # Hook Q outputs: capture OUTPUT of q_proj linear
         hooks.append(attn.q_proj.register_forward_hook(_make_output_hook(svd_q[idx])))
+
+        # Optionally collect K and V projection output subspaces (for Swift-SVD init)
+        if collect_kv:
+            k_out = attn.k_proj.out_features
+            v_out = attn.v_proj.out_features
+            svd_k[idx] = IncrementalSVD(dim=k_out, device=device, name=f"k_out_L{idx}")
+            svd_v[idx] = IncrementalSVD(dim=v_out, device=device, name=f"v_out_L{idx}")
+            hooks.append(attn.k_proj.register_forward_hook(_make_output_hook(svd_k[idx])))
+            hooks.append(attn.v_proj.register_forward_hook(_make_output_hook(svd_v[idx])))
 
     # ------------------------------------------------------------------
     # Forward passes (no grad)
@@ -167,10 +184,17 @@ def collect_layer_subspaces(
         ner_h = svd_h[idx].normalized_effective_rank()
         ner_q = svd_q[idx].normalized_effective_rank()
 
+        V_k, S_k, V_v, S_v = None, None, None, None
+        if collect_kv:
+            V_k, S_k = svd_k[idx].finalize()
+            V_v, S_v = svd_v[idx].finalize()
+
         result[idx] = LayerSubspaces(
             layer_idx=idx,
             V_h=V_h, S_h=S_h,
             V_q=V_q, S_q=S_q,
+            V_k=V_k, S_k=S_k,
+            V_v=V_v, S_v=S_v,
             ner_h=ner_h,
             ner_q=ner_q,
         )

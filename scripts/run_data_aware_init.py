@@ -2,29 +2,40 @@
 Data-Aware delta-Mem Initialization Script
 ==========================================
 
-Full pipeline:
-  1. Load a frozen base model (Qwen3-4B / 8B or SmolLM3-3B)
-  2. Load calibration data (long-context / memory-task distribution)
-  3. Collect per-layer activation subspaces via forward hooks (Swift-SVD method)
-  4. Attach delta-Mem adapters to the model
-  5. Re-initialize memory read/write projections from the collected subspaces
-  6. Save the initialized adapter for subsequent SFT fine-tuning
+Supports two initialization modes (--init-mode):
 
-After running this script, pass the saved adapter directory as the starting
-point to the standard SFT script (run_qasper_multimodel_write8192_train_and_benchmark_suite.sh)
-by setting  DELTA_MEM_INIT_ADAPTER_DIR=<output_dir>.
+  data_aware (default):
+    Full pipeline using activation statistics from calibration data.
+    1. Load frozen base model
+    2. Run calibration data through model, collect hidden-state subspaces
+    3. Attach delta-Mem adapters
+    4. Initialize memory projections from activation subspaces
+    5. Save adapter
 
-Usage:
+  naive_svd (ablation):
+    Initialize directly from model weight matrices — no data required.
+    1. Load frozen base model
+    2. Attach delta-Mem adapters
+    3. For each layer, SVD-decompose W_Q / W_K / W_V / W_O
+    4. Use top-r right singular vectors of W_Q → memory_q_proj
+                                           W_K → memory_k_proj
+                                           W_V → memory_v_proj
+       Use top-r left singular vectors  of W_Q → delta_q_proj
+                                           W_O → delta_o_proj
+    5. Save adapter
+
+Usage (data_aware):
     python scripts/run_data_aware_init.py \
-        --model-path /root/huggingface/hub/Qwen3-4B-Instruct-2507 \
-        --calib-file /root/data/agent_memory_qasper_ctx8192_episode_safe_seed42.jsonl \
-        --output-dir /root/models/delta_mem_data_aware_init_rank8 \
-        --rank 8 \
-        --calib-samples 512 \
-        --calib-seqlen 2048 \
-        --write-granularity token \
-        --delta-heads q,o \
-        [--scale-by-energy]  # optional: weight directions by singular values
+        --model-path /path/to/Qwen3-4B-Instruct-2507 \
+        --calib-file /path/to/qasper.jsonl \
+        --output-dir /path/to/output \
+        --init-mode data_aware
+
+Usage (naive_svd):
+    python scripts/run_data_aware_init.py \
+        --model-path /path/to/Qwen3-4B-Instruct-2507 \
+        --output-dir /path/to/output \
+        --init-mode naive_svd
 """
 from __future__ import annotations
 
@@ -44,6 +55,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deltamem.core import HFDeltaMemConfig, attach_delta_mem, save_delta_mem_adapter
 from deltamem.data_aware import collect_layer_subspaces, init_delta_mem_from_subspaces
+from deltamem.data_aware.init_from_subspace import init_delta_mem_swift_svd
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,9 +76,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--model-path", required=True,
                    help="Path to the frozen base model (HuggingFace format)")
-    p.add_argument("--calib-file", required=True,
-                   help="JSONL calibration file. Each line should be a JSON object "
-                        "with a 'messages' field (list of {role, content}) or raw 'text'.")
+    p.add_argument("--calib-file", default=None,
+                   help="JSONL calibration file (required for data_aware mode). "
+                        "Each line: {'messages': [...]} or {'text': '...'}")
+    p.add_argument("--init-mode", default="data_aware",
+                   choices=["data_aware", "naive_svd", "swift_svd"],
+                   help="data_aware: original impl — hidden-state subspace only (V_h). "
+                        "swift_svd: correct Swift-SVD impl — memory_k/q/v_proj = V_r.T @ W. "
+                        "naive_svd: SVD directly on weight matrices, no data needed.")
     p.add_argument("--output-dir", required=True,
                    help="Directory to save the initialized delta-Mem adapter")
 
@@ -184,8 +201,79 @@ def load_calib_batches(
 # Main
 # ---------------------------------------------------------------------------
 
+def naive_svd_init(model, config: "HFDeltaMemConfig") -> dict:
+    """
+    Initialize delta-Mem memory projections from SVD of attention weight matrices.
+
+    For each transformer layer with delta-Mem attached:
+      memory_q/k/v_proj  ← top-r right singular vectors of W_Q / W_K / W_V
+      delta_q_proj        ← top-r left  singular vectors of W_Q  (if q in delta_heads)
+      delta_o_proj        ← top-r left  singular vectors of W_O  (if o in delta_heads)
+
+    Returns a dict of per-layer energy fractions captured by rank-r approximation.
+    """
+    rank = config.rank
+    energy_fractions = {}
+    n_layers = 0
+
+    for layer_idx, layer in enumerate(model.model.layers):
+        attn = layer.self_attn
+
+        # Skip layers where delta-Mem was not attached
+        if not hasattr(attn, "memory_q_proj"):
+            continue
+
+        device = attn.memory_q_proj.device
+        dtype  = attn.memory_q_proj.dtype
+
+        def _top_r_svd(W: torch.Tensor, r: int):
+            """Return (U_r, Sigma_r, Vt_r) and energy fraction for W."""
+            W_f = W.float()
+            U, S, Vh = torch.linalg.svd(W_f, full_matrices=False)
+            energy = (S[:r].pow(2).sum() / S.pow(2).sum()).item()
+            return U[:, :r], S[:r], Vh[:r, :], energy
+
+        # W_Q: shape [q_out, hidden]  →  right SV → memory_q_proj [r, hidden]
+        W_Q = attn.base.q_proj.weight.data   # [q_out, hidden]
+        _, _, Vt_Q, e_q = _top_r_svd(W_Q, rank)
+        attn.memory_q_proj.data.copy_(Vt_Q.to(device=device, dtype=dtype))
+
+        # W_K: shape [kv_out, hidden]
+        W_K = attn.base.k_proj.weight.data
+        _, _, Vt_K, e_k = _top_r_svd(W_K, rank)
+        attn.memory_k_proj.data.copy_(Vt_K.to(device=device, dtype=dtype))
+
+        # W_V: shape [kv_out, hidden]
+        W_V = attn.base.v_proj.weight.data
+        _, _, Vt_V, e_v = _top_r_svd(W_V, rank)
+        attn.memory_v_proj.data.copy_(Vt_V.to(device=device, dtype=dtype))
+
+        # W_Q left SVs → delta_q_proj [hidden, r]  (if q in active heads)
+        if hasattr(attn, "delta_q_proj") and "q" in config.delta_heads:
+            U_Q, _, _, _ = _top_r_svd(W_Q, rank)
+            attn.delta_q_proj.data.copy_(U_Q.to(device=device, dtype=dtype))
+
+        # W_O left SVs → delta_o_proj [hidden, r]  (if o in active heads)
+        if hasattr(attn, "delta_o_proj") and "o" in config.delta_heads:
+            W_O = attn.base.o_proj.weight.data   # [hidden, v_out]
+            U_O, _, _, _ = _top_r_svd(W_O, rank)
+            attn.delta_o_proj.data.copy_(U_O[:, :rank].to(device=device, dtype=dtype))
+
+        avg_e = (e_q + e_k + e_v) / 3
+        energy_fractions[layer_idx] = avg_e
+        logger.info("Layer %2d | naive SVD init  energy_avg@%d=%.4f  (q=%.3f k=%.3f v=%.3f)",
+                    layer_idx, rank, avg_e, e_q, e_k, e_v)
+        n_layers += 1
+
+    logger.info("Naive SVD init done for %d layers.", n_layers)
+    return energy_fractions
+
+
 def main() -> None:
     args = parse_args()
+
+    if args.init_mode == "data_aware" and args.calib_file is None:
+        raise ValueError("--calib-file is required for --init-mode data_aware")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -242,55 +330,88 @@ def main() -> None:
                 args.rank, args.num_state_heads, args.delta_heads, args.write_granularity)
 
     # ------------------------------------------------------------------
-    # 3. Collect data-aware subspaces from the FROZEN base model
-    #    (before attaching delta-Mem, so hooks target vanilla attention)
+    # 3. Attach delta-Mem adapters
     # ------------------------------------------------------------------
-    logger.info("=== Phase 1: Collecting activation subspaces ===")
-    calib_batches = load_calib_batches(
-        args.calib_file,
-        tokenizer,
-        max_samples=args.calib_samples,
-        seqlen=args.calib_seqlen,
-        batch_size=args.calib_batch_size,
-        seed=args.seed,
-        device=device,
-    )
-
-    subspaces = collect_layer_subspaces(
-        model,
-        calib_batches,
-        device=str(device),
-        show_progress=True,
-        log_stats=True,
-    )
-    logger.info("Collected subspaces for %d layers.", len(subspaces))
-
-    # ------------------------------------------------------------------
-    # 4. Attach delta-Mem adapters to the model
-    # ------------------------------------------------------------------
-    logger.info("=== Phase 2: Attaching delta-Mem adapters ===")
+    logger.info("=== Phase 1: Attaching delta-Mem adapters ===")
     replaced = attach_delta_mem(model, config)
     logger.info("Replaced %d attention modules.", len(replaced))
-
-    # Count trainable parameters
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Trainable parameters: %.2fM", trainable / 1e6)
 
     # ------------------------------------------------------------------
-    # 5. Re-initialize memory projections from data-aware subspaces
+    # 4a. DATA-AWARE (original): hidden-state subspace only
     # ------------------------------------------------------------------
-    logger.info("=== Phase 3: Data-aware initialization ===")
-    energy_fractions = init_delta_mem_from_subspaces(
-        model,
-        subspaces,
-        online_gain=args.online_gain,
-        init_memory_proj=True,
-        init_delta_q=not args.no_init_delta_q,
-        init_delta_o=not args.no_init_delta_o,
-        scale_by_energy=args.scale_by_energy,
-    )
+    if args.init_mode == "data_aware":
+        logger.info("=== Phase 2 (data_aware): Collecting activation subspaces ===")
+        calib_batches = load_calib_batches(
+            args.calib_file,
+            tokenizer,
+            max_samples=args.calib_samples,
+            seqlen=args.calib_seqlen,
+            batch_size=args.calib_batch_size,
+            seed=args.seed,
+            device=device,
+        )
+        subspaces = collect_layer_subspaces(
+            model,
+            calib_batches,
+            collect_kv=False,
+            device=str(device),
+            show_progress=True,
+            log_stats=True,
+        )
+        logger.info("Collected subspaces for %d layers.", len(subspaces))
 
-    # Summary statistics
+        logger.info("=== Phase 3 (data_aware): Initializing from activation subspaces ===")
+        energy_fractions = init_delta_mem_from_subspaces(
+            model,
+            subspaces,
+            online_gain=args.online_gain,
+            init_memory_proj=True,
+            init_delta_q=not args.no_init_delta_q,
+            init_delta_o=not args.no_init_delta_o,
+            scale_by_energy=args.scale_by_energy,
+        )
+
+    # ------------------------------------------------------------------
+    # 4c. SWIFT-SVD: correct implementation — memory_proj = V_r.T @ W
+    # ------------------------------------------------------------------
+    elif args.init_mode == "swift_svd":
+        logger.info("=== Phase 2 (swift_svd): Collecting Q/K/V output subspaces ===")
+        calib_batches = load_calib_batches(
+            args.calib_file,
+            tokenizer,
+            max_samples=args.calib_samples,
+            seqlen=args.calib_seqlen,
+            batch_size=args.calib_batch_size,
+            seed=args.seed,
+            device=device,
+        )
+        subspaces = collect_layer_subspaces(
+            model,
+            calib_batches,
+            collect_kv=True,
+            device=str(device),
+            show_progress=True,
+            log_stats=True,
+        )
+        logger.info("Collected subspaces for %d layers.", len(subspaces))
+
+        logger.info("=== Phase 3 (swift_svd): Initializing with Swift-SVD formula ===")
+        energy_fractions = init_delta_mem_swift_svd(
+            model,
+            subspaces,
+            online_gain=args.online_gain,
+            init_delta_q=not args.no_init_delta_q,
+        )
+
+    # ------------------------------------------------------------------
+    # 4b. NAIVE SVD: initialize directly from weight matrices, no data
+    # ------------------------------------------------------------------
+    else:
+        logger.info("=== Phase 2 (naive_svd): Initializing from weight matrix SVD ===")
+        energy_fractions = naive_svd_init(model, config)
+
     avg_energy = sum(energy_fractions.values()) / max(len(energy_fractions), 1)
     logger.info(
         "Average energy captured by rank-%d subspace across %d layers: %.3f",
@@ -307,10 +428,11 @@ def main() -> None:
 
     # Save init metadata for reproducibility
     meta = {
+        "init_mode": args.init_mode,
         "model_path": args.model_path,
         "calib_file": args.calib_file,
-        "calib_samples": args.calib_samples,
-        "calib_seqlen": args.calib_seqlen,
+        "calib_samples": args.calib_samples if args.init_mode == "data_aware" else None,
+        "calib_seqlen": args.calib_seqlen if args.init_mode == "data_aware" else None,
         "seed": args.seed,
         "rank": args.rank,
         "num_state_heads": args.num_state_heads,

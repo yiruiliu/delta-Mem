@@ -168,6 +168,88 @@ def init_delta_mem_from_subspaces(
     return energy_fractions
 
 
+def init_delta_mem_swift_svd(
+    model: torch.nn.Module,
+    subspaces: Dict[int, "LayerSubspaces"],
+    *,
+    online_gain: Optional[float] = None,
+    init_delta_q: bool = True,
+) -> Dict[int, float]:
+    """
+    Swift-SVD–style initialization for delta-Mem memory projections.
+
+    Correct implementation following Swift-SVD (row-vector convention):
+      Y = X W,  C = Y^T Y,  C = V Σ^2 V^T,  V_r = V[:, :R]  (top-R cols)
+
+    For each projection:
+      memory_k_proj [R, H]  ← (W_K V_r_k)^T  =  V_r_k.T @ k_proj.weight
+      memory_q_proj [R, H]  ← (W_Q V_r_q)^T  =  V_r_q.T @ q_proj.weight
+      memory_v_proj [R, H]  ← (W_V V_r_v)^T  =  V_r_v.T @ v_proj.weight
+      delta_q_proj [q_out, R] ← V_r_q   (up proj: F.linear applies .T automatically)
+
+    Requires subspaces collected with collect_kv=True so that V_k and V_v
+    are available.
+
+    NOTE: This is a NEW implementation. Previous results used
+    init_delta_mem_from_subspaces() which only used the hidden-state subspace
+    V_h and did not incorporate the weight matrices W_K/W_Q/W_V.
+    """
+    energy_fractions: Dict[int, float] = {}
+
+    for name, module in iter_delta_mem_modules(model):
+        layer_idx = module.layer_idx
+        if layer_idx not in subspaces:
+            continue
+
+        sub = subspaces[layer_idx]
+        gain = online_gain if online_gain is not None else module.online_gain
+        rank = module.rank
+        R = module.state_read_dim  # = rank * num_state_heads
+
+        # Fetch weight matrices from the frozen backbone
+        base = module.base
+        dev = module.memory_k_proj.device
+        dty = module.memory_k_proj.dtype
+
+        def _init_down_proj(param, V_r, W_weight, name_str):
+            """memory_*_proj ← (W V_r)^T = V_r.T @ W_weight ∈ [R, H]"""
+            if V_r is None:
+                logger.warning("Layer %d: V for %s not available, skipping.", layer_idx, name_str)
+                return None
+            V_r_top = V_r[:, :R].float()            # [out_dim, R]
+            W = W_weight.float()                     # [out_dim, in_dim=H] (PyTorch storage)
+            init = V_r_top.T @ W                     # [R, out_dim] @ [out_dim, H] = [R, H]
+            _check_shape(init, param, name_str, layer_idx)
+            with torch.no_grad():
+                param.data.copy_(init.to(device=dev, dtype=dty))
+            return _energy(V_r[:, :R].float().new_tensor(
+                torch.linalg.eigvalsh(V_r_top.T @ V_r_top)), R)
+
+        # memory_k_proj ← V_r_k.T @ k_proj.weight
+        e_k = _init_down_proj(module.memory_k_proj, sub.V_k, base.k_proj.weight, "memory_k_proj")
+
+        # memory_q_proj ← V_r_q.T @ q_proj.weight
+        e_q = _init_down_proj(module.memory_q_proj, sub.V_q, base.q_proj.weight, "memory_q_proj")
+
+        # memory_v_proj ← V_r_v.T @ v_proj.weight
+        e_v = _init_down_proj(module.memory_v_proj, sub.V_v, base.v_proj.weight, "memory_v_proj")
+
+        # delta_q_proj [q_out, R] ← V_r_q  (up proj; F.linear applies .T, giving x @ V_r_q.T)
+        if init_delta_q and "q" in module.active_delta_heads and sub.V_q is not None:
+            V_r_q = sub.V_q[:, :R].float() * gain   # [q_out, R]
+            _check_shape(V_r_q, module.delta_q_proj, "delta_q_proj", layer_idx)
+            with torch.no_grad():
+                module.delta_q_proj.data.copy_(V_r_q.to(device=dev, dtype=dty))
+            logger.info("Layer %3d | delta_q_proj init  gain=%.4f", layer_idx, gain)
+
+        avg_e = sum(e for e in [e_k, e_q, e_v] if e is not None) / max(
+            sum(1 for e in [e_k, e_q, e_v] if e is not None), 1)
+        energy_fractions[layer_idx] = avg_e
+        logger.info("Layer %3d | swift_svd init  R=%d  avg_energy=%.3f", layer_idx, R, avg_e)
+
+    return energy_fractions
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

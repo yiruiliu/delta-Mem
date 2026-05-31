@@ -50,6 +50,7 @@ def init_delta_mem_from_subspaces(
     init_delta_q: bool = True,
     init_delta_o: bool = True,
     scale_by_energy: bool = False,
+    memory_v_scale: Optional[float] = None,
 ) -> Dict[int, float]:
     """
     Re-initialize the memory projections of every DeltaMemAttention layer
@@ -68,6 +69,13 @@ def init_delta_mem_from_subspaces(
         scale_by_energy:  If True, scale each direction by its relative energy
                           (singular value / sum), amplifying the most important
                           directions.  Default False (keep unit vectors).
+        memory_v_scale:   Scale factor applied ONLY to memory_v_proj.
+                          memory_q/k_proj are unaffected (their output goes
+                          through tanh+L2norm so scale is irrelevant).
+                          None → no scaling (original behaviour, unit vectors).
+                          Recommended: set to online_gain (e.g. 0.05) to keep
+                          v_t^m at a reasonable magnitude and avoid IFEval
+                          regression caused by over-large S accumulation.
 
     Returns:
         Dict mapping layer_idx → fraction of hidden-state variance captured
@@ -90,19 +98,26 @@ def init_delta_mem_from_subspaces(
         # 1. Memory write/read projection initialization
         #    memory_{q,k,v}_proj shape: [state_read_dim, hidden_size]
         #    We want each row to be one principal direction of h.
+        #
+        #    Note: memory_q/k_proj outputs go through tanh+L2norm, so their
+        #    scale does not matter. Only memory_v_proj scale matters because
+        #    v_t^m = W_v^m x_t has no normalization and directly controls the
+        #    magnitude of values written into S.
         # ------------------------------------------------------------------
         if init_memory_proj:
             V_h_r = _get_top_r(sub.V_h, sub.S_h, state_read_dim, scale_by_energy)
             # V_h_r: [H, R]  →  need [R, H]
-            mem_proj = V_h_r.T.contiguous()  # [R, H]
+            mem_proj = V_h_r.T.contiguous()  # [R, H], unit-norm rows
             _check_shape(mem_proj, module.memory_k_proj, "memory_k_proj", layer_idx)
             _check_shape(mem_proj, module.memory_q_proj, "memory_q_proj", layer_idx)
             _check_shape(mem_proj, module.memory_v_proj, "memory_v_proj", layer_idx)
 
+            v_scale = memory_v_scale if memory_v_scale is not None else 1.0
+
             with torch.no_grad():
                 module.memory_k_proj.data.copy_(mem_proj.to(module.memory_k_proj.dtype))
-                module.memory_v_proj.data.copy_(mem_proj.to(module.memory_v_proj.dtype))
                 module.memory_q_proj.data.copy_(mem_proj.to(module.memory_q_proj.dtype))
+                module.memory_v_proj.data.copy_((mem_proj * v_scale).to(module.memory_v_proj.dtype))
 
             energy_fractions[layer_idx] = _energy(sub.S_h, state_read_dim)
             logger.info(
@@ -211,28 +226,28 @@ def init_delta_mem_swift_svd(
         dev = module.memory_k_proj.device
         dty = module.memory_k_proj.dtype
 
-        def _init_down_proj(param, V_r, W_weight, name_str):
+        def _init_down_proj(param, V_r, S_r, W_weight, name_str):
             """memory_*_proj ← (W V_r)^T = V_r.T @ W_weight ∈ [R, H]"""
             if V_r is None:
                 logger.warning("Layer %d: V for %s not available, skipping.", layer_idx, name_str)
                 return None
-            V_r_top = V_r[:, :R].float()            # [out_dim, R]
-            W = W_weight.float()                     # [out_dim, in_dim=H] (PyTorch storage)
-            init = V_r_top.T @ W                     # [R, out_dim] @ [out_dim, H] = [R, H]
+            V_r_top = V_r[:, :R].float().to(dev)     # [out_dim, R]  — move to same device as param
+            W = W_weight.float()                      # [out_dim, in_dim=H] (PyTorch storage, already on dev)
+            init = V_r_top.T @ W                      # [R, out_dim] @ [out_dim, H] = [R, H]
             _check_shape(init, param, name_str, layer_idx)
             with torch.no_grad():
                 param.data.copy_(init.to(device=dev, dtype=dty))
-            return _energy(V_r[:, :R].float().new_tensor(
-                torch.linalg.eigvalsh(V_r_top.T @ V_r_top)), R)
+            # Energy: fraction of output variance captured by top-R directions
+            return _energy(S_r.float(), R) if S_r is not None else None
 
         # memory_k_proj ← V_r_k.T @ k_proj.weight
-        e_k = _init_down_proj(module.memory_k_proj, sub.V_k, base.k_proj.weight, "memory_k_proj")
+        e_k = _init_down_proj(module.memory_k_proj, sub.V_k, sub.S_k, base.k_proj.weight, "memory_k_proj")
 
         # memory_q_proj ← V_r_q.T @ q_proj.weight
-        e_q = _init_down_proj(module.memory_q_proj, sub.V_q, base.q_proj.weight, "memory_q_proj")
+        e_q = _init_down_proj(module.memory_q_proj, sub.V_q, sub.S_q, base.q_proj.weight, "memory_q_proj")
 
         # memory_v_proj ← V_r_v.T @ v_proj.weight
-        e_v = _init_down_proj(module.memory_v_proj, sub.V_v, base.v_proj.weight, "memory_v_proj")
+        e_v = _init_down_proj(module.memory_v_proj, sub.V_v, sub.S_v, base.v_proj.weight, "memory_v_proj")
 
         # delta_q_proj [q_out, R] ← V_r_q  (up proj; F.linear applies .T, giving x @ V_r_q.T)
         if init_delta_q and "q" in module.active_delta_heads and sub.V_q is not None:

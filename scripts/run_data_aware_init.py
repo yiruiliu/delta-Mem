@@ -111,6 +111,11 @@ def parse_args() -> argparse.Namespace:
     # Init options
     p.add_argument("--scale-by-energy", action="store_true",
                    help="Scale each subspace direction by its relative singular value")
+    p.add_argument("--memory-v-scale", type=float, default=None,
+                   help="Scale factor applied only to memory_v_proj init. "
+                        "memory_q/k_proj are unaffected (tanh+L2norm makes their scale irrelevant). "
+                        "Recommended: set to --online-gain (0.05) to prevent IFEval regression "
+                        "caused by unit-norm memory_v_proj writing over-large values into S.")
     p.add_argument("--no-init-delta-q", action="store_true",
                    help="Skip data-aware init for delta_q_proj")
     p.add_argument("--no-init-delta-o", action="store_true",
@@ -330,19 +335,14 @@ def main() -> None:
                 args.rank, args.num_state_heads, args.delta_heads, args.write_granularity)
 
     # ------------------------------------------------------------------
-    # 3. Attach delta-Mem adapters
+    # 3. Collect subspaces BEFORE attaching delta-Mem
+    #    (hooks must target the raw q/k/v_proj, not DeltaMemAttention.base)
     # ------------------------------------------------------------------
-    logger.info("=== Phase 1: Attaching delta-Mem adapters ===")
-    replaced = attach_delta_mem(model, config)
-    logger.info("Replaced %d attention modules.", len(replaced))
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info("Trainable parameters: %.2fM", trainable / 1e6)
-
-    # ------------------------------------------------------------------
-    # 4a. DATA-AWARE (original): hidden-state subspace only
-    # ------------------------------------------------------------------
-    if args.init_mode == "data_aware":
-        logger.info("=== Phase 2 (data_aware): Collecting activation subspaces ===")
+    subspaces = None
+    if args.init_mode in ("data_aware", "swift_svd"):
+        collect_kv = (args.init_mode == "swift_svd")
+        mode_label = "swift_svd Q/K/V output" if collect_kv else "data_aware hidden-state"
+        logger.info("=== Phase 1: Collecting %s subspaces (before attach) ===", mode_label)
         calib_batches = load_calib_batches(
             args.calib_file,
             tokenizer,
@@ -355,14 +355,27 @@ def main() -> None:
         subspaces = collect_layer_subspaces(
             model,
             calib_batches,
-            collect_kv=False,
+            collect_kv=collect_kv,
             device=str(device),
             show_progress=True,
             log_stats=True,
         )
         logger.info("Collected subspaces for %d layers.", len(subspaces))
 
-        logger.info("=== Phase 3 (data_aware): Initializing from activation subspaces ===")
+    # ------------------------------------------------------------------
+    # 4. Attach delta-Mem adapters
+    # ------------------------------------------------------------------
+    logger.info("=== Phase 2: Attaching delta-Mem adapters ===")
+    replaced = attach_delta_mem(model, config)
+    logger.info("Replaced %d attention modules.", len(replaced))
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info("Trainable parameters: %.2fM", trainable / 1e6)
+
+    # ------------------------------------------------------------------
+    # 5a. DATA-AWARE (original): hidden-state subspace only
+    # ------------------------------------------------------------------
+    if args.init_mode == "data_aware":
+        logger.info("=== Phase 3 (data_aware): Initializing from hidden-state subspaces ===")
         energy_fractions = init_delta_mem_from_subspaces(
             model,
             subspaces,
@@ -371,32 +384,13 @@ def main() -> None:
             init_delta_q=not args.no_init_delta_q,
             init_delta_o=not args.no_init_delta_o,
             scale_by_energy=args.scale_by_energy,
+            memory_v_scale=args.memory_v_scale,
         )
 
     # ------------------------------------------------------------------
-    # 4c. SWIFT-SVD: correct implementation — memory_proj = V_r.T @ W
+    # 5b. SWIFT-SVD: correct — memory_proj = V_r.T @ W
     # ------------------------------------------------------------------
     elif args.init_mode == "swift_svd":
-        logger.info("=== Phase 2 (swift_svd): Collecting Q/K/V output subspaces ===")
-        calib_batches = load_calib_batches(
-            args.calib_file,
-            tokenizer,
-            max_samples=args.calib_samples,
-            seqlen=args.calib_seqlen,
-            batch_size=args.calib_batch_size,
-            seed=args.seed,
-            device=device,
-        )
-        subspaces = collect_layer_subspaces(
-            model,
-            calib_batches,
-            collect_kv=True,
-            device=str(device),
-            show_progress=True,
-            log_stats=True,
-        )
-        logger.info("Collected subspaces for %d layers.", len(subspaces))
-
         logger.info("=== Phase 3 (swift_svd): Initializing with Swift-SVD formula ===")
         energy_fractions = init_delta_mem_swift_svd(
             model,
@@ -406,10 +400,10 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------
-    # 4b. NAIVE SVD: initialize directly from weight matrices, no data
+    # 5c. NAIVE SVD: directly from weight matrices, no data
     # ------------------------------------------------------------------
     else:
-        logger.info("=== Phase 2 (naive_svd): Initializing from weight matrix SVD ===")
+        logger.info("=== Phase 3 (naive_svd): Initializing from weight matrix SVD ===")
         energy_fractions = naive_svd_init(model, config)
 
     avg_energy = sum(energy_fractions.values()) / max(len(energy_fractions), 1)
